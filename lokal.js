@@ -27,7 +27,7 @@ function setStatus(ok){try{if(typeof S!=='undefined'){S.conn=ok?'ok':'err';rende
 
 /* ---------- Anmeldung ---------- */
 let pca=null, account=null;
-function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=()=>rej(new Error('Anmeldebibliothek konnte nicht geladen werden (Internet?)'));document.head.appendChild(s)})}
+function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=()=>rej({text:'Programmbaustein konnte nicht geladen werden (Internetverbindung?)'});document.head.appendChild(s)})}
 function gate(html){
   let g=document.getElementById('m365-gate');
   if(!g){g=document.createElement('div');g.id='m365-gate';g.style.cssText='position:fixed;inset:0;z-index:200;display:grid;place-items:center;background:var(--bg,#f4f6f8);font-family:system-ui,-apple-system,sans-serif;padding:16px';document.body.appendChild(g)}
@@ -190,10 +190,59 @@ const outlook={
   }
 };
 
-/* ---------- Einlesen (Visitenkarte, Lebenslauf, .msg) ---------- */
-const notYet=()=>Promise.reject({text:'In der Microsoft-365-Version noch nicht verfügbar (folgt).'});
+/* ---------- Einlesen im Browser (Visitenkarte, Lebenslauf) ----------
+   Die Bausteine werden erst beim ersten Einlesen geladen (Texterkennung inkl. deutschem Sprachpaket ca. 4 MB). */
+const LIB={
+  tess:'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+  tessWorker:'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
+  tessCore:'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
+  pdf:'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js',
+  pdfWorker:'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js',
+  zip:'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js'
+};
+const libs={};
+const lib=(k,glob)=>libs[k]||(libs[k]=loadScript(LIB[k]).then(()=>window[glob]));
+let ocrWorker=null;
+async function ocrImage(img){   // Blob oder Canvas → Text
+  const T=await lib('tess','Tesseract');
+  if(!ocrWorker) ocrWorker=T.createWorker('deu',1,{workerPath:LIB.tessWorker,corePath:LIB.tessCore});
+  const {data}=await (await ocrWorker).recognize(img);
+  return data.text||'';
+}
+// PDF: Textebene lesen (Zeilen nach Höhe zusammensetzen); Seiten ohne Text (Scan) per Texterkennung
+async function pdfText(file){
+  const pdfjs=await lib('pdf','pdfjsLib'); pdfjs.GlobalWorkerOptions.workerSrc=LIB.pdfWorker;
+  const doc=await pdfjs.getDocument({data:await file.arrayBuffer()}).promise;
+  const out=[];
+  for(let i=1;i<=Math.min(doc.numPages,3);i++){
+    const page=await doc.getPage(i); const tc=await page.getTextContent(); const rows={};
+    for(const it of tc.items){if(!it.str)continue;const y=Math.round(it.transform[5]/3);(rows[y]=rows[y]||[]).push(it)}
+    const txt=Object.keys(rows).map(Number).sort((a,b)=>b-a).map(y=>rows[y].sort((a,b)=>a.transform[4]-b.transform[4]).map(x=>x.str).join(' ').replace(/\s+/g,' ').trim()).filter(Boolean).join('\n');
+    if(txt.replace(/\s/g,'').length>40){out.push(txt);continue}
+    const vp=page.getViewport({scale:2}); const c=document.createElement('canvas'); c.width=vp.width; c.height=vp.height;
+    await page.render({canvasContext:c.getContext('2d'),viewport:vp}).promise; out.push(await ocrImage(c));
+  }
+  return out.join('\n\n');
+}
+// DOCX: Kopfzeilen, Dokument, Fußzeilen als Text
+async function docxText(file){
+  const Z=await lib('zip','JSZip'); const z=await Z.loadAsync(await file.arrayBuffer());
+  const rank=n=>/header/.test(n)?0:/document/.test(n)?1:2;
+  const names=Object.keys(z.files).filter(n=>/^word\/(header\d*|document|footer\d*)\.xml$/.test(n)).sort((a,b)=>rank(a)-rank(b));
+  const out=[];
+  for(const n of names){const x=await z.file(n).async('string');const t=document.createElement('textarea');t.innerHTML=x.replace(/<\/w:p>/g,'\n').replace(/<w:tab\/>/g,'\t').replace(/<w:br\/>/g,'\n').replace(/<[^>]+>/g,'');out.push(t.value)}
+  return out.join('\n');
+}
 window.crmTools={
-  ocr:notYet, msg:notYet, doc:notYet, selected:notYet,
+  ocr:async blob=>({ok:true,text:await ocrImage(blob)}),
+  doc:async file=>{
+    const ext=file.name.split('.').pop().toLowerCase();
+    if(ext==='pdf') return {ok:true,text:await pdfText(file)};
+    if(ext==='docx') return {ok:true,text:await docxText(file)};
+    throw {text:'Dieses Format geht in der App nicht. Bitte als PDF oder .docx speichern.'};
+  },
+  msg:()=>Promise.reject({text:'.msg-Dateien gehen in der App nicht. Bitte die Mail öffnen, Text kopieren und einfügen.'}),
+  selected:()=>Promise.reject({text:'In der App nicht verfügbar.'}),
   auth:{
     status:async()=>{await ready;return {m365:true,local:false,authed:true,user:account&&(account.name||account.username),username:account&&account.username}},
     logout:async()=>{await ready;pca.logoutRedirect({account})}
