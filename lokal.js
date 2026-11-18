@@ -203,11 +203,31 @@ const LIB={
 const libs={};
 const lib=(k,glob)=>libs[k]||(libs[k]=loadScript(LIB[k]).then(()=>window[glob]));
 let ocrWorker=null;
-async function ocrImage(img){   // Blob oder Canvas → Text
+// Foto auf eine für die Texterkennung gute Größe bringen (ca. 2000 px); Farbe bleibt, Tesseract binarisiert selbst
+async function prepImage(img){
+  const src=img instanceof HTMLCanvasElement?img:await createImageBitmap(img);
+  const s=Math.min(2.5,2000/Math.max(src.width,src.height));
+  if(Math.abs(s-1)<0.05&&src instanceof HTMLCanvasElement) return src;
+  const c=document.createElement('canvas'); c.width=Math.round(src.width*s); c.height=Math.round(src.height*s);
+  c.getContext('2d').drawImage(src,0,0,c.width,c.height);
+  return c;
+}
+// Schräg fotografierte Karten automatisch gerade richten (rotateAuto); bei unsicherem Ergebnis zweiter Lesemodus
+async function ocrImage(img,opt={}){
   const T=await lib('tess','Tesseract');
-  if(!ocrWorker) ocrWorker=T.createWorker('deu',1,{workerPath:LIB.tessWorker,corePath:LIB.tessCore});
-  const {data}=await (await ocrWorker).recognize(img);
-  return data.text||'';
+  if(!ocrWorker) ocrWorker=T.createWorker(['deu','eng'],1,{workerPath:LIB.tessWorker,corePath:LIB.tessCore});
+  const w=await ocrWorker, c=await prepImage(img);
+  let best=null;
+  for(const psm of opt.page?['3']:['3','11']){
+    await w.setParameters({tessedit_pageseg_mode:psm});
+    const {data}=await w.recognize(c,{rotateAuto:true});
+    // Zeilen mit sehr geringer Sicherheit (Logos, Muster) weglassen
+    const lines=(data.lines||[]).filter(l=>l.confidence>=35&&/[A-Za-zÄÖÜäöü0-9@]{2}/.test(l.text)).map(l=>l.text.trim());
+    const r={conf:data.confidence||0,text:lines.length?lines.join('\n'):(data.text||'')};
+    if(!best||r.conf>best.conf) best=r;
+    if(best.conf>=75) break;
+  }
+  return best.text;
 }
 // PDF: Textebene lesen (Zeilen nach Höhe zusammensetzen); Seiten ohne Text (Scan) per Texterkennung
 async function pdfText(file){
@@ -220,7 +240,7 @@ async function pdfText(file){
     const txt=Object.keys(rows).map(Number).sort((a,b)=>b-a).map(y=>rows[y].sort((a,b)=>a.transform[4]-b.transform[4]).map(x=>x.str).join(' ').replace(/\s+/g,' ').trim()).filter(Boolean).join('\n');
     if(txt.replace(/\s/g,'').length>40){out.push(txt);continue}
     const vp=page.getViewport({scale:2}); const c=document.createElement('canvas'); c.width=vp.width; c.height=vp.height;
-    await page.render({canvasContext:c.getContext('2d'),viewport:vp}).promise; out.push(await ocrImage(c));
+    await page.render({canvasContext:c.getContext('2d'),viewport:vp}).promise; out.push(await ocrImage(c,{page:true}));
   }
   return out.join('\n\n');
 }
